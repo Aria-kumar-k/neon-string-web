@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neon String Web</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;overflow:hidden;font-family:'Courier New',monospace;}
+#wrap{position:relative;width:100vw;height:100vh;}
+#vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);opacity:0.45;z-index:0;}
+#cv{position:absolute;inset:0;width:100%;height:100%;z-index:1;}
+#overlay{
+  position:absolute;inset:0;z-index:20;background:#000;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;
+  transition:opacity 0.7s;
+}
+#overlay h1{color:#b57bff;font-size:clamp(22px,5vw,44px);letter-spacing:0.18em;text-transform:uppercase;}
+#overlay p{color:rgba(255,255,255,0.42);font-size:13px;letter-spacing:0.06em;text-align:center;max-width:400px;line-height:1.9;}
+#startBtn{
+  padding:12px 40px;background:transparent;border:1px solid #b57bff;color:#b57bff;
+  font-family:'Courier New',monospace;font-size:13px;letter-spacing:0.12em;
+  cursor:pointer;text-transform:uppercase;transition:background 0.2s;
+}
+#startBtn:hover{background:rgba(181,123,255,0.14);}
+#startBtn:disabled{opacity:0.35;cursor:default;}
+#msg{color:rgba(181,123,255,0.6);font-size:12px;letter-spacing:0.1em;min-height:18px;text-align:center;max-width:360px;}
+#hud{
+  position:absolute;bottom:18px;left:50%;transform:translateX(-50%);
+  color:rgba(255,255,255,0.3);font-size:11px;letter-spacing:0.08em;
+  text-align:center;line-height:2.2;z-index:5;pointer-events:none;display:none;
+}
+#clearBtn{
+  position:absolute;top:14px;right:18px;z-index:5;
+  background:transparent;border:1px solid rgba(255,79,216,0.35);
+  color:rgba(255,79,216,0.65);font-family:'Courier New',monospace;
+  font-size:11px;letter-spacing:0.09em;padding:5px 14px;
+  cursor:pointer;text-transform:uppercase;border-radius:4px;display:none;
+}
+#clearBtn:hover{background:rgba(255,79,216,0.1);}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="vid" autoplay playsinline muted></video>
+  <canvas id="cv"></canvas>
+  <div id="overlay">
+    <h1>Neon String Web</h1>
+    <p>Pinch thumb + index finger to place a node.<br>
+       Pinch again elsewhere to connect with a glowing string.<br>
+       Move fingers near nodes to push &amp; jiggle.</p>
+    <button id="startBtn">Enable Camera</button>
+    <div id="msg"></div>
+  </div>
+  <div id="hud">
+    PINCH — place &amp; connect node &nbsp;·&nbsp;
+    OPEN HAND — push &amp; jiggle &nbsp;·&nbsp;
+    BOTH HANDS — build together
+  </div>
+  <button id="clearBtn">Clear</button>
+</div>
+
+<!-- Three.js ONLY — no addon scripts that depend on THREE being pre-loaded -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<!-- MediaPipe — loaded after Three so globals are safe -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+(function(){
+  // ── SANITY CHECK ──────────────────────────────────────────────────────────
+  if (typeof THREE === 'undefined') {
+    document.getElementById('msg').textContent = 'THREE failed to load — check internet connection.';
+    return;
+  }
+
+  var startBtn = document.getElementById('startBtn');
+  var msgEl    = document.getElementById('msg');
+  var overlay  = document.getElementById('overlay');
+  var hud      = document.getElementById('hud');
+  var clearBtn = document.getElementById('clearBtn');
+  var vid      = document.getElementById('vid');
+  var cv       = document.getElementById('cv');
+
+  // ── RENDERER ──────────────────────────────────────────────────────────────
+  var renderer = new THREE.WebGLRenderer({ canvas: cv, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x000000, 0);
+
+  var scene  = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
+  camera.position.z = 2;
+
+  window.addEventListener('resize', function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ── GLOW via additive second-pass mesh (no bloom addon needed) ────────────
+  // Each glowing object gets a larger, semi-transparent additive twin
+  function makeGlowMesh(geo, color, scale, opacity) {
+    var mat = new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: opacity,
+      side: THREE.FrontSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    });
+    var m = new THREE.Mesh(geo, mat);
+    m.scale.setScalar(scale);
+    return m;
+  }
+
+  // ── PALETTE ───────────────────────────────────────────────────────────────
+  var PALETTE = [0xff4fd8, 0x4fffff, 0xb57bff, 0x7bff9e, 0xffdd4f, 0xff7b4f, 0x4f9eff, 0xff4f7b];
+  var ci = 0;
+
+  // ── STATE ─────────────────────────────────────────────────────────────────
+  var nodes       = [];
+  var edges       = [];
+  var pSystems    = [];
+  var liveFingers = [];
+
+  // ── COORD CONVERSION ──────────────────────────────────────────────────────
+  function mpToScene(lm) {
+    var aspect = window.innerWidth / window.innerHeight;
+    var tan30  = Math.tan(THREE.Math.degToRad(30));
+    return new THREE.Vector3(
+      (0.5 - lm.x) * 2.0 * aspect * tan30,
+      (0.5 - lm.y) * 2.0 * tan30,
+      0
+    );
+  }
+
+  // ── NODE ──────────────────────────────────────────────────────────────────
+  function addNode(x, y, color) {
+    var geo  = new THREE.SphereGeometry(0.021, 16, 16);
+    var mat  = new THREE.MeshBasicMaterial({ color: color });
+    var mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, 0);
+
+    // additive glow halos
+    mesh.add(makeGlowMesh(new THREE.SphereGeometry(0.021, 16, 16), color, 2.2, 0.18));
+    mesh.add(makeGlowMesh(new THREE.SphereGeometry(0.021, 16, 16), color, 3.8, 0.07));
+
+    scene.add(mesh);
+    var node = {
+      pos:   new THREE.Vector3(x, y, 0),
+      vel:   new THREE.Vector3(0, 0, 0),
+      mesh:  mesh,
+      color: color
+    };
+    nodes.push(node);
+    spawnBurst(x, y, color);
+    return nodes.length - 1;
+  }
+
+  // ── EDGE ──────────────────────────────────────────────────────────────────
+  function addEdge(ai, bi) {
+    if (ai === bi) return;
+    for (var k = 0; k < edges.length; k++) {
+      var e = edges[k];
+      if ((e.a === ai && e.b === bi) || (e.a === bi && e.b === ai)) return;
+    }
+    var color   = PALETTE[ci++ % PALETTE.length];
+    var restLen = nodes[ai].pos.distanceTo(nodes[bi].pos);
+    var edge    = { a: ai, b: bi, restLen: restLen, color: color,
+                    tube: null, glow: null, points: [], lastPluck: 0 };
+    edges.push(edge);
+    triggerPluck(restLen);
+  }
+
+  function buildCurvePoints(edge) {
+    var a   = nodes[edge.a].pos;
+    var b   = nodes[edge.b].pos;
+    var sag = new THREE.Vector3(-(b.y - a.y), b.x - a.x, 0)
+                .normalize().multiplyScalar(0.055);
+    var mid = new THREE.Vector3()
+                .addVectors(a, b).multiplyScalar(0.5).add(sag);
+    mid.z = Math.sin(Date.now() * 0.0007 + edge.a * 1.7) * 0.04;
+    var curve = new THREE.QuadraticBezierCurve3(a.clone(), mid, b.clone());
+    return curve.getPoints(30);
+  }
+
+  function rebuildEdge(edge) {
+    edge.points = buildCurvePoints(edge);
+    var spline  = new THREE.CatmullRomCurve3(edge.points);
+
+    // main tube
+    var geo = new THREE.TubeGeometry(spline, 30, 0.006, 5, false);
+    var mat = new THREE.MeshBasicMaterial({
+      color: edge.color,
+      transparent: true,
+      opacity: 0.92
+    });
+
+    // glow tube (wider, additive)
+    var gGeo = new THREE.TubeGeometry(spline, 30, 0.018, 5, false);
+    var gMat = new THREE.MeshBasicMaterial({
+      color: edge.color,
+      transparent: true,
+      opacity: 0.13,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    });
+    var gGeo2 = new THREE.TubeGeometry(spline, 30, 0.032, 5, false);
+    var gMat2 = new THREE.MeshBasicMaterial({
+      color: edge.color,
+      transparent: true,
+      opacity: 0.05,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    });
+
+    if (edge.tube) { scene.remove(edge.tube); edge.tube.geometry.dispose(); edge.tube.material.dispose(); }
+    if (edge.glow) { scene.remove(edge.glow); edge.glow.geometry.dispose(); edge.glow.material.dispose(); }
+    if (edge.glow2){ scene.remove(edge.glow2);edge.glow2.geometry.dispose();edge.glow2.material.dispose();}
+
+    edge.tube  = new THREE.Mesh(geo,  mat);
+    edge.glow  = new THREE.Mesh(gGeo, gMat);
+    edge.glow2 = new THREE.Mesh(gGeo2,gMat2);
+    scene.add(edge.glow2);
+    scene.add(edge.glow);
+    scene.add(edge.tube);
+  }
+
+  // ── PARTICLES ─────────────────────────────────────────────────────────────
+  function spawnBurst(x, y, color) {
+    var N    = 22;
+    var pos  = new Float32Array(N * 3);
+    var vels = [];
+    for (var i = 0; i < N; i++) {
+      pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = 0;
+      var a = Math.random() * Math.PI * 2;
+      var s = 0.007 + Math.random() * 0.018;
+      vels.push(new THREE.Vector3(
+        Math.cos(a) * s, Math.sin(a) * s, (Math.random() - 0.5) * 0.012
+      ));
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    var mat = new THREE.PointsMaterial({
+      color: color, size: 0.026,
+      transparent: true, opacity: 1,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    var ps = new THREE.Points(geo, mat);
+    scene.add(ps);
+    pSystems.push({ ps: ps, vels: vels, life: 1.0 });
+  }
+
+  function tickParticles() {
+    for (var i = pSystems.length - 1; i >= 0; i--) {
+      var p = pSystems[i];
+      p.life -= 0.022;
+      p.ps.material.opacity = Math.max(0, p.life);
+      var arr = p.ps.geometry.attributes.position.array;
+      for (var j = 0; j < p.vels.length; j++) {
+        p.vels[j].y -= 0.00025;
+        arr[j*3]   += p.vels[j].x;
+        arr[j*3+1] += p.vels[j].y;
+        arr[j*3+2] += p.vels[j].z;
+      }
+      p.ps.geometry.attributes.position.needsUpdate = true;
+      if (p.life <= 0) {
+        scene.remove(p.ps);
+        p.ps.geometry.dispose();
+        p.ps.material.dispose();
+        pSystems.splice(i, 1);
+      }
+    }
+  }
+
+  // ── AUDIO ─────────────────────────────────────────────────────────────────
+  var actx = null;
+  function ensureAudio() {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+  }
+
+  function triggerPluck(len) {
+    ensureAudio();
+    var clamped = Math.min(Math.max(len, 0.05), 1.5);
+    var freq = 900 - (clamped - 0.05) / 1.45 * 800;
+    var t    = actx.currentTime;
+    var osc  = actx.createOscillator();
+    var filt = actx.createBiquadFilter();
+    var gain = actx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(freq, t);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.45, t + 0.85);
+    filt.type = 'bandpass';
+    filt.frequency.value = freq * 1.6;
+    filt.Q.value = 9;
+    gain.gain.setValueAtTime(0.3, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 1.1);
+    osc.connect(filt); filt.connect(gain); gain.connect(actx.destination);
+    osc.start(t); osc.stop(t + 1.1);
+  }
+
+  // ── PHYSICS ───────────────────────────────────────────────────────────────
+  var DAMP   = 0.87;
+  var GRAV   = 0.00007;
+  var STIFF  = 0.11;
+  var PUSH_R = 0.14;
+
+  function tickPhysics() {
+    // spring constraints
+    for (var ei = 0; ei < edges.length; ei++) {
+      var e = edges[ei];
+      var na = nodes[e.a], nb = nodes[e.b];
+      var dx = nb.pos.x - na.pos.x;
+      var dy = nb.pos.y - na.pos.y;
+      var dz = nb.pos.z - na.pos.z;
+      var len = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1e-5;
+      var f   = (len - e.restLen) * STIFF / len;
+      na.vel.x += dx * f; na.vel.y += dy * f; na.vel.z += dz * f;
+      nb.vel.x -= dx * f; nb.vel.y -= dy * f; nb.vel.z -= dz * f;
+    }
+
+    // finger push + edge pluck
+    var now = Date.now();
+    for (var fi = 0; fi < liveFingers.length; fi++) {
+      var fp = liveFingers[fi];
+
+      for (var ni = 0; ni < nodes.length; ni++) {
+        var n = nodes[ni];
+        var ndx = n.pos.x - fp.x, ndy = n.pos.y - fp.y, ndz = n.pos.z - fp.z;
+        var nd  = Math.sqrt(ndx*ndx + ndy*ndy + ndz*ndz);
+        if (nd < PUSH_R && nd > 0.001) {
+          var pf = (PUSH_R - nd) / PUSH_R * 0.022 / nd;
+          n.vel.x += ndx * pf; n.vel.y += ndy * pf; n.vel.z += ndz * pf;
+        }
+      }
+
+      for (var ei2 = 0; ei2 < edges.length; ei2++) {
+        var e2 = edges[ei2];
+        if (now - e2.lastPluck < 350) continue;
+        var pts = e2.points;
+        for (var pi = 2; pi < pts.length - 2; pi++) {
+          var pdx = fp.x - pts[pi].x, pdy = fp.y - pts[pi].y;
+          if (pdx*pdx + pdy*pdy < 0.068 * 0.068) {
+            triggerPluck(e2.restLen);
+            e2.lastPluck = now;
+            var imp = 0.018;
+            nodes[e2.a].vel.x += (Math.random()-.5)*imp;
+            nodes[e2.a].vel.y += (Math.random()-.5)*imp;
+            nodes[e2.b].vel.x -= (Math.random()-.5)*imp;
+            nodes[e2.b].vel.y -= (Math.random()-.5)*imp;
+            break;
+          }
+        }
+      }
+    }
+
+    // integrate
+    for (var ni2 = 0; ni2 < nodes.length; ni2++) {
+      var n2 = nodes[ni2];
+      n2.vel.y -= GRAV;
+      n2.vel.x *= DAMP; n2.vel.y *= DAMP; n2.vel.z *= DAMP;
+      n2.pos.x += n2.vel.x; n2.pos.y += n2.vel.y; n2.pos.z += n2.vel.z;
+      n2.pos.x = Math.max(-2.5, Math.min(2.5,  n2.pos.x));
+      n2.pos.y = Math.max(-1.5, Math.min(1.5,  n2.pos.y));
+      n2.pos.z = Math.max(-0.3, Math.min(0.3,  n2.pos.z));
+      n2.mesh.position.copy(n2.pos);
+    }
+  }
+
+  // ── FINGER INDICATOR DOTS ─────────────────────────────────────────────────
+  var fDots = [];
+  for (var fd = 0; fd < 10; fd++) {
+    var fdMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.014, 8, 8),
+      new THREE.MeshBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false
+      })
+    );
+    scene.add(fdMesh);
+    fDots.push(fdMesh);
+  }
+
+  // ── GUIDE LINES ───────────────────────────────────────────────────────────
+  var pendLines = [];
+  for (var pl = 0; pl < 2; pl++) {
+    var plGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(), new THREE.Vector3()
+    ]);
+    var plLine = new THREE.Line(plGeo,
+      new THREE.LineBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending
+      })
+    );
+    scene.add(plLine);
+    pendLines.push(plLine);
+  }
+
+  // ── HAND STATE ────────────────────────────────────────────────────────────
+  var pinched  = [false, false];
+  var cooldown = [0, 0];
+  var pendNd   = [-1, -1];
+
+  function onHandResults(res) {
+    liveFingers = [];
+    var numHands = (res.multiHandLandmarks && res.multiHandLandmarks.length) || 0;
+
+    for (var hi = 0; hi < Math.min(numHands, 2); hi++) {
+      var lm = res.multiHandLandmarks[hi];
+      var tips = [4, 8, 12, 16, 20];
+      for (var ti = 0; ti < tips.length; ti++) {
+        var p = mpToScene(lm[tips[ti]]);
+        liveFingers.push(p);
+        var dot = fDots[hi * 5 + ti];
+        dot.position.copy(p);
+        dot.material.opacity = 0.85;
+      }
+
+      var thumb   = mpToScene(lm[4]);
+      var index   = mpToScene(lm[8]);
+      var mid     = new THREE.Vector3(
+        (thumb.x + index.x) * 0.5,
+        (thumb.y + index.y) * 0.5, 0
+      );
+      var pinchD  = thumb.distanceTo(index);
+      var isPinch = pinchD < 0.09;
+
+      if (isPinch && !pinched[hi] && cooldown[hi] <= 0) {
+        cooldown[hi] = 22;
+        var col  = PALETTE[ci % PALETTE.length];
+        var near = -1;
+        for (var k = 0; k < nodes.length; k++) {
+          if (nodes[k].pos.distanceTo(mid) < 0.14) { near = k; break; }
+        }
+        var ni = (near >= 0) ? near : addNode(mid.x, mid.y, col);
+        if (pendNd[hi] >= 0 && pendNd[hi] < nodes.length && pendNd[hi] !== ni) {
+          addEdge(pendNd[hi], ni);
+        }
+        pendNd[hi] = ni;
+      }
+      pinched[hi] = isPinch;
+      if (cooldown[hi] > 0) cooldown[hi]--;
+
+      // guide line to cursor
+      var pl2 = pendLines[hi];
+      if (pendNd[hi] >= 0 && pendNd[hi] < nodes.length) {
+        pl2.geometry.setFromPoints([nodes[pendNd[hi]].pos.clone(), mid]);
+        pl2.material.opacity = 0.2;
+      } else {
+        pl2.material.opacity = 0;
+      }
+    }
+
+    // hide unused dots
+    for (var ui = numHands * 5; ui < fDots.length; ui++) {
+      fDots[ui].material.opacity = 0;
+    }
+    if (numHands < 2) {
+      pendLines[1].material.opacity = 0;
+    }
+  }
+
+  // ── RENDER LOOP ───────────────────────────────────────────────────────────
+  (function loop() {
+    requestAnimationFrame(loop);
+    tickPhysics();
+    for (var ei = 0; ei < edges.length; ei++) rebuildEdge(edges[ei]);
+    tickParticles();
+    renderer.render(scene, camera);
+  })();
+
+  // ── CLEAR ─────────────────────────────────────────────────────────────────
+  clearBtn.addEventListener('click', function () {
+    for (var i = 0; i < nodes.length; i++) {
+      scene.remove(nodes[i].mesh);
+      nodes[i].mesh.geometry.dispose();
+    }
+    for (var j = 0; j < edges.length; j++) {
+      var e = edges[j];
+      if (e.tube)  { scene.remove(e.tube);  e.tube.geometry.dispose();  e.tube.material.dispose(); }
+      if (e.glow)  { scene.remove(e.glow);  e.glow.geometry.dispose();  e.glow.material.dispose(); }
+      if (e.glow2) { scene.remove(e.glow2); e.glow2.geometry.dispose(); e.glow2.material.dispose();}
+    }
+    nodes.length = 0; edges.length = 0;
+    pendNd[0] = -1; pendNd[1] = -1; ci = 0;
+  });
+
+  // ── START BUTTON ──────────────────────────────────────────────────────────
+  startBtn.addEventListener('click', function () {
+    startBtn.disabled = true;
+    msgEl.textContent = 'Requesting camera…';
+
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: 640, height: 360 }, audio: false
+    }).then(function (stream) {
+      vid.srcObject = stream;
+      return vid.play();
+    }).then(function () {
+      msgEl.textContent = 'Loading hand tracking model…';
+
+      if (typeof Hands === 'undefined') {
+        msgEl.textContent = 'MediaPipe not loaded — check internet and reload.';
+        startBtn.disabled = false;
+        return;
+      }
+
+      var hands = new Hands({
+        locateFile: function (f) {
+          return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/' + f;
+        }
+      });
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.72,
+        minTrackingConfidence: 0.65
+      });
+      hands.onResults(onHandResults);
+
+      var cam = new Camera(vid, {
+        onFrame: function () { return hands.send({ image: vid }); },
+        width: 640, height: 360
+      });
+      cam.start().then(function () {
+        overlay.style.opacity = '0';
+        setTimeout(function () { overlay.style.display = 'none'; }, 700);
+        hud.style.display = 'block';
+        clearBtn.style.display = 'block';
+        setTimeout(function () {
+          hud.style.transition = 'opacity 1.2s';
+          hud.style.opacity = '0';
+        }, 6000);
+      });
+
+    }).catch(function (err) {
+      console.error(err);
+      msgEl.textContent = err.name === 'NotAllowedError'
+        ? 'Camera permission denied — allow and retry.'
+        : 'Error: ' + err.message;
+      startBtn.disabled = false;
+      startBtn.textContent = 'Retry';
+    });
+  });
+
+})();
+</script>
+</body>
+</html>
